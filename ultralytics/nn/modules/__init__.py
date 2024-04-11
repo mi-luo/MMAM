@@ -17,6 +17,16 @@ Example:
     ```
 """
 
+# from .sdi import *
+from .asf import (
+    attention_model, 
+    Add, 
+    ScalSeq, 
+    Zoom_cat, 
+    IIM,
+    )
+
+
 from .block import (
     C1,
     C2,
@@ -75,6 +85,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+
 
 __all__ = (
     "Conv",
@@ -135,4 +146,11 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "Silence",
+    # "ShiftConv",
+    # "GhostConv1",
+    # "AddConcat",
+    # "FusionConv",
+    "attention_model", "Add", "ScalSeq", "Zoom_cat", "IIM",
 )
+
+

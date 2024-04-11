@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -21,6 +22,10 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "ShiftConv",
+    "GhostConv1",
+    "AddConcat",
+    "FusionConv",
 )
 
 
@@ -37,7 +42,6 @@ class Conv(nn.Module):
     """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
 
     default_act = nn.SiLU()  # default activation
-
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         """Initialize Conv layer with given arguments including activation."""
         super().__init__()
@@ -170,6 +174,104 @@ class GhostConv(nn.Module):
         """Forward propagation through a Ghost Bottleneck layer with skip connection."""
         y = self.cv1(x)
         return torch.cat((y, self.cv2(y)), 1)
+
+
+class ShiftConv(nn.Module):
+    def __init__(self, c1, c2, k=1): 
+        super().__init__()
+        # c1,c1:128  512
+        self.conv1_0 = nn.Conv2d(c1, c2, 1)
+        self.conv1_1 = nn.Conv2d(c2, c2, 1)
+        self.conv2 = nn.Conv2d(c1, c2, 3, 1, 1)
+        # self.conv2 = nn.Conv2d(c2, c1, 3, 1, 1)
+        self.cv1 = nn.Conv2d(2,1,3,1,1,bias=False)
+        self.act = nn.Sigmoid()
+        self.bn = nn.BatchNorm2d(c2)
+        self.silu = nn.SiLU()
+    def spatial_shift(self,x):
+        b,w,h,c = x.size()
+        x_clone = x.clone()
+        # x[:,1:,:,:intc/4] = x_clone[:,:w-1,:,:c/4]  # 注 c一定要是4的整数倍！
+        # x[:,:w-1,:,c/4:c/2] = x_clone[:,1:,:,c/4:c/2]
+        # x[:,:,1:,c/2:c*3/4] = x_clone[:,:,:h-1,c/2:c*3/4]
+        # x[:,:,:h-1,3*c/4:] = x_clone[:,:,1:,3*c/4:]
+
+        x[:,1:,:,:int(c/4)] = x_clone[:,:w-1,:,:int(c/4)]  # 注 c一定要是4的整数倍！
+        x[:,:w-1,:,int(c/4):int(c/2)] = x_clone[:,1:,:,int(c/4):int(c/2)]
+        x[:,:,1:,int(c/2):int(c*3/4)] = x_clone[:,:,:h-1,int(c/2):int(c*3/4)]
+        x[:,:,:h-1,3*int(c/4):] = x_clone[:,:,1:,3*int(c/4):]
+
+        return x
+
+    def forward(self, x):
+        x = self.spatial_shift(x) # 空间shift操作
+        y = self.silu(self.bn(self.conv2(x))) # 卷积+ BN +激活 
+        y = self.conv1_1(y)
+        x = x * self.act(self.cv1(torch.cat([torch.mean(y, 1, keepdim=True), torch.max(y, 1, keepdim=True)[0]], 1))) # 空间注意力
+        # print("---out shift",x.shape)  # [1,]
+        return x
+
+
+class GhostConv1(nn.Module):
+    """Ghost Convolution https://github.com/huawei-noah/ghostnet."""
+
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        """Initializes the GhostConv object with input channels, output channels, kernel size, stride, groups and
+        activation.
+        """
+        super().__init__()
+        # c1 c2 c_:128  512 256
+        # print(" GhostConv1 in c2",c2)
+        c_ = c2 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+        self.cv3 = nn.Conv2d(2, 1, 3, padding=1, bias=False)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        """Forward propagation through a Ghost Bottleneck layer with skip connection."""
+        y = self.cv1(x) # 卷积
+        y1 = torch.cat((y, self.cv2(y)), 1) # 两部分通道卷积拼接
+        y = y1 * self.act(self.cv3(torch.cat([torch.mean(y1, 1, keepdim=True), torch.max(y1, 1, keepdim=True)[0]], 1)))
+        # print("---GhostConv1 in",y.shape)
+        return y
+
+class FusionConv1(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__()
+        # print("c1,c2",c1,c2) # 256 1024 c2 =4c1
+        self.ShiftConv = ShiftConv(c1,c2) # 128 512
+        self.GhostConv1 = GhostConv1(c1,c2)
+        # print("----",self.ShiftConv,self.GhostConv1)
+        self.cv1 = nn.Conv2d(2*c1,c2,1)  # 512 1024
+        self.cv2 = nn.Conv2d(5*c1,c1,1)
+        print("5c1",5*c1)
+
+        # print("----------",c1,c2) #c1,c2:256 1024
+    def forward(self, x):
+        x1,x2 = x
+        x1 = self.ShiftConv(x1) # torch.Size([1, 256, 16, 16])
+        x2 = self.GhostConv1(x2) # torch.Size([1, 1024, 16, 16])
+        print("-------",torch.cat([x1,x2],1).shape) # torch.Size([1, 1280, 16, 16])
+        x12 = self.cv2(torch.cat([x1,x2],1)) 
+
+        print(" FusionConv in  x12",x12.shape)
+        print("---",x1.shape,x2.shape) # torch.Size([1, 256, 16, 16]) torch.Size([1, 1024, 16, 16])
+        # print("------------",self.cv1(torch.cat([x1,x2],1)).shape)
+        # return self.cv1(torch.cat([x1,x2],1))   # torch.Size([1, 256, 16, 16]) torch.Size([1, 1024, 16, 16])
+        return x12
+    
+    
+class AddConcat(nn.Module):
+    def __init__(self,dimension=1):
+        super().__init__()
+        self.d = dimension
+    def forward(self, x):
+        # print("------",x[0].shape,x[1].shape)
+        y = torch.cat([x[0],x[1]],1) # torch.Size([1, 1408, 16, 16])
+
+        return y  # torch.Size([1, 1024, 16, 16]) torch.Size([1, 384, 16, 16])
+
 
 
 class RepConv(nn.Module):
@@ -330,4 +432,5 @@ class Concat(nn.Module):
 
     def forward(self, x):
         """Forward pass for the YOLOv8 mask Proto module."""
+        # print("concat shape------",torch.cat(x, self.d).shape)
         return torch.cat(x, self.d)

@@ -6,6 +6,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+# from ultralytics.nn.modules import ShiftConv,GhostConv1
+
+from ultralytics.nn.modules import attention_model, Add, ScalSeq, Zoom_cat, IIM
+
 
 from ultralytics.nn.modules import (
     AIFI,
@@ -49,6 +53,10 @@ from ultralytics.nn.modules import (
     CBFuse,
     CBLinear,
     Silence,
+    # ShiftConv,
+    # GhostConv1,
+    # AddConcat,
+    # FusionConv,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -284,6 +292,7 @@ class DetectionModel(BaseModel):
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
+        # 读取yaml的网络结构搭建网络-->parse_model
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
@@ -626,7 +635,7 @@ class WorldModel(DetectionModel):
         return x
 
 
-class Ensemble(nn.ModuleList):
+class Ensemble(nn.ModuleList): # ensemble表示将多个元素或组件组合在一起
     """Ensemble of models."""
 
     def __init__(self):
@@ -646,7 +655,7 @@ class Ensemble(nn.ModuleList):
 
 
 @contextlib.contextmanager
-def temporary_modules(modules=None):
+def temporary_modules(modules=None): # 核心更改的地方！！！
     """
     Context manager for temporarily adding or modifying modules in Python's module cache (`sys.modules`).
 
@@ -833,7 +842,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args  ！
         m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
@@ -867,8 +876,14 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             DWConvTranspose2d,
             C3x,
             RepC3,
+            # ShiftConv,
+            # GhostConv1,
         ):
-            c1, c2 = ch[f], args[0]
+            # print("current module name: ", m)  # !!!!!!!
+            # print("-----",f) # !!!!!!!
+            # if m is ShiftConv:  # !!!!!!!
+            #     print("parse model: ", args) # !!!!!!!
+            c1, c2 = ch[f], args[0]  # ch[f]为上一层的输出通道
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
             if m is C2fAttn:
@@ -881,6 +896,44 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             if m in (BottleneckCSP, C1, C2, C2f, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3):
                 args.insert(2, n)  # number of repeats
                 n = 1
+        # elif m is FusionConv:
+        #     if ch[f[0]]==ch[f[1]]:
+        #         # print("----",int(sum(ch[x] for x in f)/2))
+        #         c1,c2 = int(sum(ch[x] for x in f)/2),args[0]
+        #         # c1,c2 = int(sum(ch[x] for x in f)),args[0]
+        #         args = [c1, c2, *args[1:]]
+        #         # print(args[1:])
+        #     else:
+        #         print("-----FusionConv error------")
+        #         print(ch[f[0]],ch[f[1]])  # 256 128
+        #         print("f[0] =! f[1]")
+
+        # elif m is FusionConv:
+        #     print("++++++++++",*args)
+                
+
+        #=============asf==================     
+        elif m is Zoom_cat:
+            c2 = sum(ch[x] for x in f)
+        elif m is Add:
+            c2 = ch[f[-1]]
+        elif m is ScalSeq:
+            c1 = [ch[x] for x in f]
+            c2 = make_divisible(args[0] * width, 8)
+            args = [c1, c2]
+        elif m is attention_model:
+            args = [ch[f[-1]]]
+
+        
+        #=============asf==================   
+            
+        #=============IIM==================
+
+        elif m is IIM:
+            args = [[ch[x] for x in f]]
+
+        #=============IIM==================
+   
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in (HGStem, HGBlock):
@@ -893,8 +946,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[1] if args[3] else args[1] * 4
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
+        # elif m in (Concat,AddConcat):
         elif m is Concat:
+            # print("-----")
             c2 = sum(ch[x] for x in f)
+        
         elif m in (Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn):
             args.append([ch[x] for x in f])
             if m is Segment:
@@ -908,8 +964,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is CBFuse:
             c2 = ch[f[-1]]
         else:
+            # print ("----",f)
+            # print("current module name: ", m)
             c2 = ch[f]
 
+        # if m is ShiftConv:  # !!!!!!!!!!!!
+        #     print("allllllll: ", *args)
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m.np = sum(x.numel() for x in m_.parameters())  # number params
