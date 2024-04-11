@@ -1,4 +1,4 @@
-# Flame-detection(SFGDN)
+# MMAM
 A multi-scale and multi-constraint aggregation network (MMAN) for remote sensing image detection is proposed.
 
 ## install
